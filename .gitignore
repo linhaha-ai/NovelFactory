@@ -1,0 +1,33 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# ---- 本地写作工作区（小说内容，不上传）----
+novel_factory/
+novel_factory_guizeguaitan/
+novel_factory_lingquan/
+novel_factory_moyunongchang/
+
+# ---- 本机临时脚本 ----
+_tmp_drive_write.py
+
+# ---- 数据库 / 日志 ----
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# ---- IDE / 操作系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
