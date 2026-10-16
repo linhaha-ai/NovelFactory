@@ -17,6 +17,7 @@ novel_factory_moyunongchang/
 
 # ---- 本机临时脚本 ----
 _tmp_drive_write.py
+_tmp_*.py
 
 # ---- 数据库 / 日志 ----
 *.db

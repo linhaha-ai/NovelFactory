@@ -71,7 +71,9 @@ def load_config(workspace: Path) -> Dict[str, Any]:
                   "word_tolerance": 0.1, "tone": "网文通俗叙事，少AI腔"},
         "llm": {"provider": "ollama", "base_url": "http://localhost:11434",
                 "model": "qwen3.5:9b", "temperature_write": 0.7,
-                "temperature_review": 0.2, "timeout": 300},
+                "temperature_review": 0.2, "timeout": 300,
+                "num_ctx": 16384, "keep_alive": "30m"},
+        "memory": {"timeline_recent_n": 15},
         "pipeline": {"start": 1, "end": 5, "max_retry": 1},
     }
     cfg_path = workspace / "config.toml"

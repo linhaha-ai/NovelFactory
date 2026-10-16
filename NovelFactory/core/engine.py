@@ -32,6 +32,7 @@ class NovelFactoryEngine:
         self.db = NovelDB(self.workspace)
         self.manuscript_dir = self.workspace / "manuscript"
         self.plans_dir = self.workspace / "plot" / "chapter_plans"
+        self._ctx_cache: Dict[int, Dict[str, Any]] = {}
 
     # ---------------------------------------------------------------- 上下文
     def _read_prompt(self, name: str) -> str:
@@ -39,7 +40,16 @@ class NovelFactoryEngine:
         return read_text(p).strip()
 
     def load_context(self, chapter_no: int) -> Dict[str, Any]:
-        """按需加载第 N 章写作上下文：细纲 + 出场人物 + 记忆 + 上一章结尾。"""
+        """按需加载第 N 章写作上下文：细纲 + 出场人物 + 记忆 + 上一章结尾。
+
+        记忆裁剪（控制 prompt 长度、提速）：
+        - 时间线只取最近 N 章（config memory.timeline_recent_n，默认 15）
+        - 伏笔清单只保留【未回收】条目（已回收的不再进入上下文）
+        - 人物档案按细纲提及的人名过滤，细纲未提及时才全量加载
+        """
+        if chapter_no in self._ctx_cache:
+            return self._ctx_cache[chapter_no]
+
         ch_id = f"ch{chapter_no:03d}"
         plan_path = self.plans_dir / f"{ch_id}_plan.md"
         plan = ChapterPlan.load(plan_path)
@@ -47,23 +57,29 @@ class NovelFactoryEngine:
         characters: List[str] = []
         chars_dir = self.workspace / "characters"
         if chars_dir.exists():
-            for p in sorted(chars_dir.glob("*.md")):
+            char_files = sorted(chars_dir.glob("*.md"))
+            plan_brief = plan.brief
+            mentioned = [p for p in char_files if p.stem in plan_brief]
+            selected = mentioned if mentioned else char_files
+            for p in selected:
                 characters.append(f"### {p.stem}\n{read_text(p).strip()}")
 
         memory = ""
         mem_dir = self.workspace / "memory"
-        timeline = read_text(mem_dir / "timeline.md").strip()
-        foreshadow = read_text(mem_dir / "foreshadow.md").strip()
+        mcfg = self.config.get("memory", {})
+        recent_n = int(mcfg.get("timeline_recent_n", 15))
+        timeline = _recent_timeline(read_text(mem_dir / "timeline.md").strip(), recent_n)
+        foreshadow = _active_foreshadow(read_text(mem_dir / "foreshadow.md").strip())
         if timeline:
             memory += f"【时间线】\n{timeline}\n"
         if foreshadow:
-            memory += f"\n【伏笔清单】\n{foreshadow}\n"
+            memory += f"\n【伏笔清单】（仅未回收）\n{foreshadow}\n"
 
         prev_id = f"ch{chapter_no - 1:03d}"
         prev_text = read_text(self.manuscript_dir / f"{prev_id}.md")
         prev_tail = tail(prev_text, 600) if prev_text else "（这是第一章，无前文）"
 
-        return {
+        ctx = {
             "chapter_id": ch_id,
             "chapter_no": chapter_no,
             "plan": plan,
@@ -72,6 +88,8 @@ class NovelFactoryEngine:
             "prev_tail": prev_tail,
             "world": read_text(self.workspace / "world.md").strip(),
         }
+        self._ctx_cache[chapter_no] = ctx
+        return ctx
 
     # ---------------------------------------------------------------- LLM
     def call_llm(self, system: str, user: str, temperature: float) -> str:
@@ -90,9 +108,16 @@ class NovelFactoryEngine:
         if provider == "ollama":
             url = f"{base}/api/chat"
             # think=False 关闭 Qwen3 系列思考模式，显著提速（否则每次先输出大段思考链）
+            # num_ctx / keep_alive 可配：keep_alive 避免模型反复卸载加载（加载一次 10~30s）
+            options = {"temperature": temperature}
+            num_ctx = self.config["llm"].get("num_ctx")
+            if num_ctx:
+                options["num_ctx"] = int(num_ctx)
             body = {"model": model, "messages": messages, "stream": False,
-                    "think": False,
-                    "options": {"temperature": temperature}}
+                    "think": False, "options": options}
+            keep_alive = self.config["llm"].get("keep_alive")
+            if keep_alive:
+                body["keep_alive"] = keep_alive
         elif provider in ("openai", "openai-compatible", "codex"):
             url = f"{base}/v1/chat/completions"
             # API Key 优先级：config.toml 的 [llm].api_key > 环境变量 NVIDIA_API_KEY / OPENAI_API_KEY / CODEX_API_KEY
@@ -181,21 +206,27 @@ class NovelFactoryEngine:
             return
         ctx = self.load_context(chapter_no)
         memory_prompt = self._read_prompt("agent_memory.md")
+        foreshadow_path = self.workspace / "memory" / "foreshadow.md"
+        existing = read_text(foreshadow_path).strip()
         user = (
-            f"请从《{self.config['novel']['title']}》第 {ctx['chapter_no']} 章正文中提取记忆条目。\n\n"
+            f"请处理《{self.config['novel']['title']}》第 {ctx['chapter_no']} 章的记忆更新。\n\n"
             f"===== 本章正文 =====\n{content}\n\n"
-            f"按格式输出要追加到时间线/伏笔清单的两段 markdown 引用文本。"
+            f"===== 现有伏笔清单 =====\n{existing or '（暂无）'}\n\n"
+            f"按三段格式输出：时间线 / 伏笔-新增 / 伏笔-回收。"
         )
         extracted = self.call_llm(memory_prompt, user, 0.1)
-        # 剥离【时间线】/【伏笔】头部标记，按内容块分别追加
-        timeline_block, foreshadow_block = _split_memory_output(extracted)
+        # 剥离标题标记，按内容块分别处理：时间线追加、新增伏笔追加、回收伏笔标记旧条目
+        timeline_block, new_foreshadow, resolved = _split_memory_output(extracted)
         ch_id = ctx["chapter_id"]
         if timeline_block:
             append_text(self.workspace / "memory" / "timeline.md",
                         f"\n> {ch_id}\n" + _indent_quote(timeline_block))
-        if foreshadow_block:
-            append_text(self.workspace / "memory" / "foreshadow.md",
-                        f"\n> {ch_id}\n" + _indent_quote(foreshadow_block))
+        if new_foreshadow:
+            append_text(foreshadow_path,
+                        f"\n> {ch_id}\n> 【伏笔】\n" + _indent_quote(new_foreshadow))
+        if resolved:
+            marked = _mark_foreshadow_resolved(foreshadow_path, resolved)
+            print(f"  🔗 伏笔回收：已标记 {marked} 条【未回收】→【已回收】")
 
     # ---------------------------------------------------------------- 流水线
     def run_pipeline(self, start: int | None = None, end: int | None = None,
@@ -289,18 +320,96 @@ class NovelFactoryEngine:
 
 
 def _split_memory_output(text: str):
-    """把记忆 Agent 输出拆成时间线块与伏笔块。"""
-    lines = text.strip().splitlines()
-    timeline, foreshadow = [], []
+    """把记忆 Agent 输出拆成 (时间线块, 新增伏笔块, 已回收伏笔块) 三段。"""
+    timeline, new_fs, resolved = [], [], []
     target = None
-    for ln in lines:
-        if "时间线" in ln or "事件" in ln and "伏笔" not in ln:
+    for raw in text.splitlines():
+        s = raw.strip().lstrip(">").strip()
+        if not s:
+            continue
+        if re.match(r"^ch\d{3}$", s):
+            continue  # 章节标记行由引擎重新生成，不重复携带
+        if "时间线" in s and len(s) <= 12:
             target = timeline
-        elif "伏笔" in ln:
-            target = foreshadow
-        if target is not None and ln.strip():
-            target.append(ln.strip())
-    return "\n".join(timeline), "\n".join(foreshadow)
+            continue
+        if ("伏笔-新增" in s or "新增伏笔" in s or s == "【伏笔】") and len(s) <= 12:
+            target = new_fs
+            continue
+        if "伏笔-回收" in s and len(s) <= 12:
+            target = resolved
+            continue
+        if s.startswith("回收"):
+            target = resolved
+        if target is not None:
+            target.append(s)
+    return "\n".join(timeline), "\n".join(new_fs), "\n".join(resolved)
+
+
+def _mark_foreshadow_resolved(path: Path, resolved_block: str) -> int:
+    """把 foreshadow.md 中与回收描述匹配的旧伏笔条目由【未回收】改为【已回收】。
+
+    匹配策略：回收描述关键词与旧条目内容做双向子串匹配
+    （模型可能复述原伏笔，也可能只给核心关键词）。返回标记条数。
+    """
+    pending: List[str] = []
+    for ln in resolved_block.splitlines():
+        s = ln.strip().lstrip(">").strip()
+        if s.startswith("回收"):
+            kw = re.split(r"[：:]", s, maxsplit=1)[-1].strip()
+            if kw:
+                pending.append(kw)
+    if not pending:
+        return 0
+    text = read_text(path)
+    if not text:
+        return 0
+    out_lines: List[str] = []
+    marked = 0
+    unmatched: List[str] = []
+    for ln in text.splitlines():
+        if "伏笔：" in ln and "【未回收】" in ln and pending:
+            core = ln.split("伏笔：", 1)[1].replace("【未回收】", "").strip()
+            hit = next((i for i, kw in enumerate(pending)
+                        if kw in core or core[:12] in kw), None)
+            if hit is not None:
+                ln = ln.replace("【未回收】", "【已回收】")
+                marked += 1
+                pending.pop(hit)
+            else:
+                unmatched.append(ln.strip())
+        out_lines.append(ln)
+    if pending:
+        unmatched.extend(pending)
+    if marked:
+        save_text(path, "\n".join(out_lines))
+    if unmatched:
+        print(f"  ⚠ 伏笔回收：{len(unmatched)} 条未在清单中匹配到旧条目，需人工核对："
+              f"{'；'.join(u[:40] for u in unmatched[:5])}")
+    return marked
+
+
+def _recent_timeline(text: str, n: int) -> str:
+    """把 timeline.md 裁剪为最近 n 个章节块（保留文件头部注释）。"""
+    if not text:
+        return ""
+    marker = re.compile(r"(?m)^> ch\d{3}\s*$")
+    matches = list(marker.finditer(text))
+    if len(matches) <= n:
+        return text
+    head = text[: matches[0].start()].rstrip()
+    return head + "\n" + text[matches[-n].start():].strip()
+
+
+def _active_foreshadow(text: str) -> str:
+    """只保留未回收伏笔条目（【已回收】条目不进上下文，仅留历史记录）。"""
+    if not text:
+        return ""
+    lines = []
+    for ln in text.splitlines():
+        if "伏笔：" in ln and "【已回收】" in ln:
+            continue
+        lines.append(ln)
+    return "\n".join(lines).strip()
 
 
 def _indent_quote(block: str) -> str:
