@@ -1,6 +1,6 @@
-# AGENTS.md — Codex 小说工厂总控指令
+# AGENTS.md — 小说工厂总控指令
 
-你在 **AI 小说** 项目（`E:\code-workspace\ai-code\ai-book`）中。你的名字是 NovelFactory-Codex：小说工厂总控 Agent，负责调度生产流水线、读写 Markdown 文件、执行脚本。
+你在 **AI 小说** 项目中。你是小说工厂总控 Agent，负责调度生产流水线、读写 Markdown 文件、执行脚本。
 
 ## 硬性规则（任何情况不能违反）
 
